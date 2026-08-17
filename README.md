@@ -102,19 +102,63 @@ lump — you get told which part of it is the problem.
 
 ### 4. Measure sleep-mode warm start (instead of a cold start)
 
-Requires a **running** server started with `VLLM_SERVER_DEV_MODE=1` and `--enable-sleep-mode`.
+Requires a **running** server started with `VLLM_SERVER_DEV_MODE=1` **and** `--enable-sleep-mode`.
 
 ```sh
-bin/spinup-profile sleepwake --base-url http://127.0.0.1:8200 --level 2 \
-    --model Qwen/Qwen3.5-27B-FP8 --out ~/runs/sleepwake-l2.json
+bin/spinup-profile sleepwake --base-url http://127.0.0.1:8200 --level 1 \
+    --model Qwen/Qwen3.5-27B-FP8 --out ~/runs/sleepwake-l1.json
 ```
 
-Emits `{"sleep_s": …, "wake_s": …, "first_completion_s": …, "level": 2, …}` plus a `steps[]` record
+Emits `{"sleep_s": …, "wake_s": …, "first_completion_s": …, "level": 1, …}` plus a `steps[]` record
 of every call. It pre-checks with one completion (so a wrong `--model` fails *before* you put the
-server to sleep), times `POST /sleep?level=N` and `POST /wake_up`, and for level 2 also tries
-`POST /collective_rpc {"method": "reload_weights"}` and `POST /reset_prefix_cache` — those two are
-version-dependent, so a 404 is **reported, not fatal** (on newer builds `/wake_up` restores the
-weights itself). Then it times the first successful completion after wake.
+server to sleep), times `POST /sleep?level=N` and `POST /wake_up`, then times the first successful
+completion after wake.
+
+**It verifies the sleep actually happened.** A server started *without* `--enable-sleep-mode` still
+answers `POST /sleep` with **200 in ~19 ms** and stays awake — measured live on a Nebius H100 — so
+the timings from such a run are a fiction. After the sleep call this command reads
+`GET /is_sleeping` and, unless it reports `true`, wakes the server back up (so its own check never
+leaves a box asleep) and exits non-zero:
+
+```
+FAILED: server did not actually sleep — was it started with --enable-sleep-mode?
+        (/sleep returned 200 in 0.019s but /is_sleeping is still false; ...)
+```
+
+`--no-verify-sleep` overrides that if you need the raw numbers anyway. The `/is_sleeping` bodies are
+kept in `steps[]` either way.
+
+**GPU memory is the second, independent check.** `--verify-gpu-mem` samples
+`nvidia-smi --query-gpu=memory.used` before sleep, while asleep and after wake into
+`gpu_mem: {before_sleep_mib, asleep_mib, after_wake_mib, drop_pct}`, and warns via `gpu_mem_note`
+if the asleep sample did not drop by at least 30 % (it re-samples once after 1.5 s first, since some
+builds free asynchronously). It is **on by default when `nvidia-smi` works and `--base-url` is
+local**, and auto-disables for a remote URL — sampling this box's GPUs would describe the wrong
+machine. `--no-verify-gpu-mem` turns it off; passing `--verify-gpu-mem` explicitly forces it on.
+
+For level 2 the command also tries `POST /collective_rpc {"method": "reload_weights"}` and
+`POST /reset_prefix_cache`; both are version-dependent, so a failure is **reported, not fatal**.
+
+> ⚠️ **Level 2 is NOT validated on `vllm-openai:v0.20.2`.** On that build `collective_rpc
+> reload_weights` returns **500**, and the first completion after a level-2 sleep still succeeds
+> instantly — i.e. the weights were apparently never discarded, so a "level 2" number there is
+> measuring something other than a weight reload. The command flags this as `level2_note`. Quote
+> **level 1** for anything that matters until level 2 is re-verified on a newer vLLM.
+
+Verified reference numbers — **level 1**, 1×H100 80 GB, `Qwen/Qwen3.5-27B-FP8` (31 GB weights),
+`vllm-openai:v0.20.2`, sleep state and GPU memory both confirmed:
+
+| Measurement | Value |
+|---|---|
+| `sleep_s`, first cycle | 15.0 s |
+| `sleep_s`, subsequent cycles | 0.65 s |
+| `wake_s` | 0.86 s |
+| `first_completion_s` | 0.12 s |
+| **wake → serving** | **≈ 1 s** |
+| GPU memory awake → asleep → awake | 77.9 GB → 3.0 GB → 77.5 GB |
+
+Compare that against ~470 s for the cold start in the table above: sleep mode is the difference
+between a cold box and a warm one, provided you can afford to hold the GPU.
 
 ---
 
@@ -259,9 +303,17 @@ Patterns live in `spinup_profiler/patterns.py`; the span/leaf/hint model lives i
 
 ```sh
 python3 tests/test_parse.py
+python3 tests/test_sleepwake.py
 ```
 
-Plain python, no pytest, exits non-zero on failure. It parses `examples/docker.log` (a real
+Both are plain python, no pytest, and exit non-zero on failure.
+
+`test_sleepwake.py` stands up three throwaway HTTP servers in-process and asserts the sleep
+verification behaves: a server that answers `/sleep` 200 without sleeping must fail with an error
+naming `--enable-sleep-mode` (and must attempt the recovery wake), a server that really sleeps must
+report all four timings, and `--no-verify-sleep` must override the check. No GPU needed.
+
+`test_parse.py` parses `examples/docker.log` (a real
 `docker logs -t` capture) and asserts the headline numbers against the field-verified harness
 output for the same log: `total_s ≈ 470.06`, `weight_load ≈ 125.7`, the rest of the level-0
 partition and every mark within 0.1 s, compile/graph spans present, `cache_hit` false with the
@@ -286,9 +338,11 @@ spinup_profiler/
   sleepwake.py   `sleepwake` — sleep/wake/first-completion timing
   stages.py      the stage model: spans, leaves, descriptions, hints
   httpc.py       urllib wrapper that never raises
-bin/spinup-profile   shim: PYTHONPATH + python3 -m spinup_profiler
-examples/            real docker.log + meta.json + generated profile.json + report.txt
-tests/test_parse.py  regression test against the example
+  shell.py       subprocess + nvidia-smi helpers shared by run/sleepwake
+bin/spinup-profile      shim: PYTHONPATH + python3 -m spinup_profiler
+examples/               real docker.log + meta.json + generated profile.json + report.txt
+tests/test_parse.py     parser regression test against the example
+tests/test_sleepwake.py sleep-verification test against in-process fake servers
 ```
 
 ## Gotchas
@@ -302,7 +356,11 @@ tests/test_parse.py  regression test against the example
   a "persisted cache" does nothing.
 * **`--drop-caches` needs passwordless sudo.** Without it the run is warm and the report says so.
 * `run` leaves the container running on purpose. `--teardown` removes it.
-* `sleepwake` talks to endpoints that only exist under `VLLM_SERVER_DEV_MODE=1`.
+* `sleepwake` talks to endpoints that only exist under `VLLM_SERVER_DEV_MODE=1`, and needs
+  `--enable-sleep-mode` on top of that — **without it `/sleep` returns 200 and does nothing**,
+  which is exactly the false positive the `/is_sleeping` verification now catches.
+* **Sleep level 2 is unvalidated on v0.20.2** (`reload_weights` → 500, weights apparently not
+  discarded). Level 1 is the number to quote.
 
 Research background: "Minimizing vLLM Spin-Up Time" (July 2026) and the cross-cloud spin-up
 benchmark (August 2026). Ticket: **IMP-2773**.

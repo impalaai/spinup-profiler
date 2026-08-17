@@ -7,13 +7,13 @@ plus the host-event JSONL from box_bootstrap.sh, in one stdlib-only command.
 import json
 import os
 import re
-import subprocess
 import sys
 import time
 
 from . import httpc
 from .parse import build_profile, write_profile
 from .report import render
+from .shell import sh
 
 # Injected unless --no-default-env. DEBUG level is REQUIRED for the compile /
 # memory-profiling / cudagraph marks; without it those spans cannot be split.
@@ -40,18 +40,6 @@ class Events:
 
     def close(self):
         self.fh.close()
-
-
-def sh(cmd, timeout=60):
-    """Run a command, never raise. Returns (rc, stdout, stderr)."""
-    try:
-        p = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                           timeout=timeout)
-        return p.returncode, p.stdout.decode("utf-8", "replace"), p.stderr.decode("utf-8", "replace")
-    except subprocess.TimeoutExpired:
-        return 124, "", "timeout after %ss: %s" % (timeout, " ".join(cmd))
-    except FileNotFoundError as e:
-        return 127, "", str(e)
 
 
 def resolve_docker(explicit):

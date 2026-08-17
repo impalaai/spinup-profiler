@@ -108,6 +108,16 @@ def build_parser():
     s.add_argument("--hold", type=float, default=0.0, help="seconds to stay asleep before waking (default 0)")
     s.add_argument("--api-key", default=None, help="bearer token, if the server requires one")
     s.add_argument("--no-precheck", action="store_true", help="skip the pre-sleep completion check")
+    s.add_argument("--verify-sleep", dest="verify_sleep", action="store_true", default=True,
+                   help="check GET /is_sleeping after the sleep call and fail if the server did "
+                        "not actually sleep (default on)")
+    s.add_argument("--no-verify-sleep", dest="verify_sleep", action="store_false",
+                   help="report the timings even if /is_sleeping says the sleep was a no-op")
+    s.add_argument("--verify-gpu-mem", dest="verify_gpu_mem", action="store_true", default=None,
+                   help="sample nvidia-smi memory.used before sleep / asleep / after wake "
+                        "(default: on when nvidia-smi exists and --base-url is local)")
+    s.add_argument("--no-verify-gpu-mem", dest="verify_gpu_mem", action="store_false",
+                   help="skip the GPU-memory sampling")
     s.add_argument("--out", default=None, help="write the JSON result here as well")
     return p
 
