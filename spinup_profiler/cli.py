@@ -1,6 +1,7 @@
 """Argument parsing / dispatch for `python3 -m spinup_profiler`."""
 
 import argparse
+import os
 
 from . import __version__
 
@@ -18,6 +19,10 @@ EPILOG = """examples:
 
   # render the waterfall + verdict
   spinup-profile report examples/profile.json
+
+  # measure the box's ceilings, then judge a captured profile against them
+  spinup-profile probe --target /mnt/nvme --out ~/runs/base-hf/run2/probe.json \\
+      --profile ~/runs/base-hf/run2/profile.json
 
   # sleep-mode warm start against a running dev-mode server
   spinup-profile sleepwake --base-url http://127.0.0.1:8200 --level 2 \\
@@ -60,6 +65,11 @@ def build_parser():
                    help="do not sample host system metrics")
     r.add_argument("--sample-interval", type=float, default=1.0,
                    help="system sampling interval in seconds (default 1.0)")
+    r.add_argument("--prefetch", default=None, metavar="DIR|GLOB",
+                   help="warm the page cache by parallel-reading these files after --drop-caches "
+                        "and before launch (e.g. /mnt/nvme/models/Qwen3.5-27B-FP8)")
+    r.add_argument("--prefetch-jobs", type=int, default=8,
+                   help="parallel readers for --prefetch (default 8)")
     r.add_argument("--no-pull", action="store_true",
                    help="skip the timed pre-pull; docker run will pull implicitly instead")
     r.add_argument("--timeout", type=int, default=1800, help="seconds to wait for /health (default 1800)")
@@ -92,6 +102,8 @@ def build_parser():
     q.add_argument("--provision", default=None, help="provision.json (default <run-dir>/provision.json)")
     q.add_argument("--system-jsonl", default=None,
                    help="system.jsonl of host counters (default <run-dir>/system.jsonl)")
+    q.add_argument("--probe-json", default=None,
+                   help="probe.json of measured ceilings (default <run-dir>/probe.json)")
     q.add_argument("--out", default=None, help="output path (default <run-dir>/profile.json)")
     q.add_argument("--quiet", action="store_true", help="print only the output path, no report")
     q.add_argument("--width", type=int, default=44, help="waterfall bar columns (default 44)")
@@ -105,6 +117,35 @@ def build_parser():
     o.add_argument("--no-io", action="store_true",
                    help="omit the per-stage system-metrics table")
     o.add_argument("--out", default=None, help="also write the rendered report here")
+
+    # ---------------------------------------------------------------- probe
+    b = sub.add_parser("probe", help="measure this box's disk / network / object-store ceilings")
+    b.add_argument("--target", default=os.path.expanduser("~"),
+                   help="directory for the disk probes (default ~; use the volume you will serve from)")
+    b.add_argument("--size-mb", type=int, default=4096,
+                   help="test file size in MB, also the bytes read per level (default 4096)")
+    b.add_argument("--jobs", default="1,4,8",
+                   help="parallel-read levels for the disk probe (default 1,4,8)")
+    b.add_argument("--no-disk", action="store_true", help="skip the disk probes")
+    b.add_argument("--no-net", action="store_true", help="skip the network probes")
+    b.add_argument("--url", action="append",
+                   help="URL to stream, repeatable (default: the Qwen3.5-27B-FP8 HF shards)")
+    b.add_argument("--net-threads", default="4,16,32",
+                   help="parallel stream levels for the network probe (default 4,16,32)")
+    b.add_argument("--net-seconds", type=int, default=20,
+                   help="wall-clock seconds per network level (default 20)")
+    b.add_argument("--s3-env", default=None,
+                   help="file of KEY=VALUE credentials (AWS_*, AWS_ENDPOINT_URL) for the s3 sweep")
+    b.add_argument("--s3-prefix", default=None, help="s3://bucket/prefix holding the model shards")
+    b.add_argument("--s3-workers", default="16,64,256",
+                   help="s5cmd --numworkers levels (default 16,64,256)")
+    b.add_argument("--s3-cap-gb", type=float, default=8.0,
+                   help="how many GB to pull per s3 level (default 8)")
+    b.add_argument("--profile", default=None,
+                   help="profile.json to judge against these ceilings (adds the headroom table)")
+    b.add_argument("--out", default=None, help="write the full probe JSON document here")
+    b.add_argument("--no-json", action="store_true", help="do not print the JSON lines")
+    b.add_argument("--no-table", action="store_true", help="do not print the human table")
 
     # ---------------------------------------------------------------- sleepwake
     s = sub.add_parser("sleepwake", help="measure sleep-mode warm start on a RUNNING dev-mode server")
@@ -151,6 +192,9 @@ def main(argv=None):
     if args.cmd == "report":
         from .report import cmd_report
         return cmd_report(args)
+    if args.cmd == "probe":
+        from .probe import cmd_probe
+        return cmd_probe(args)
     if args.cmd == "sleepwake":
         from .sleepwake import cmd_sleepwake
         return cmd_sleepwake(args)

@@ -10,7 +10,7 @@ import re
 import sys
 import time
 
-from . import httpc, sysmetrics
+from . import httpc, prefetch, sysmetrics
 from .parse import build_profile, write_profile
 from .report import render
 from .shell import sh
@@ -262,6 +262,22 @@ def cmd_run(args):
     if args.drop_caches:
         drop_caches(ev)
 
+    # Page-cache warm-up: after the cache was dropped (otherwise it is pointless) and before the
+    # container exists, so the engine's weight read hits RAM instead of the device.
+    warmed = None
+    if args.prefetch:
+        log("prefetching %s with %d jobs" % (args.prefetch, args.prefetch_jobs))
+        ev.emit("prefetch_start", spec=args.prefetch, jobs=args.prefetch_jobs)
+        warmed = prefetch.warm(args.prefetch, jobs=args.prefetch_jobs)
+        ev.emit("prefetch_done", **{k: v for k, v in warmed.items() if k != "spec"})
+        if warmed["files"] == 0:
+            log("WARNING: --prefetch %s matched no files" % args.prefetch)
+        else:
+            log("prefetched %.2f GB from %d file(s) in %.2fs (%s MB/s)"
+                % (warmed["gb"], warmed["files"], warmed["s"], warmed["mbs"]))
+        if warmed.get("errors"):
+            log("WARNING: prefetch read errors: %s" % "; ".join(warmed["errors"]))
+
     argv = build_docker_argv(args, docker)
     log("docker run: %s" % " ".join(argv[len(docker):]))
     t_launch = ev.emit("docker_run_issued", argv=" ".join(argv))
@@ -331,6 +347,7 @@ def cmd_run(args):
         "ready_error": ready_err,
         "profiler": "spinup-profiler run",
         "sysmetrics_ticks": sampler.ticks if sampler else 0,
+        "prefetch": warmed,
     }
     meta.update({k: v for k, v in host_info.items()})
     if sanity:

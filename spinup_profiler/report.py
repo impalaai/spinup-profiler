@@ -136,6 +136,22 @@ def render(profile, width=44, top_n=3, show_hints=True, show_io=True):
         extra.append("first completion %.2f s" % profile["sanity"]["first_completion_s"])
     if extra:
         L.append(" model             %s" % "   ".join(extra))
+    pf = next((s for s in (profile.get("spans") or []) if s["name"] == "prefetch"), None)
+    if pf:
+        L.append(" prefetch          %.2f GB from %s file(s) in %.2fs @ %s MB/s (%s jobs)"
+                 % (pf.get("gb") or 0.0, pf.get("files"), pf["dur_s"], pf.get("mbs"),
+                    pf.get("jobs")))
+    if profile.get("ceilings"):
+        cl = profile["ceilings"]
+        bits = []
+        if cl.get("disk_read_best_mbs"):
+            bits.append("disk read %s MB/s%s" % (cl["disk_read_best_mbs"],
+                                                 " (scales)" if cl.get("disk_scales") else ""))
+        if cl.get("net_best_mbs"):
+            bits.append("net %s MB/s%s" % (cl["net_best_mbs"],
+                                           " (scales)" if cl.get("net_scales") else ""))
+        if bits:
+            L.append(" measured ceilings %s" % "   ".join(bits))
     L.append("")
 
     # waterfall

@@ -11,8 +11,9 @@ the bottleneck — plus the lever that shortened it in the IMP-2773 research.
   the cross-cloud spin-up benchmark, verified against `vllm/vllm-openai:v0.20.x` at
   `VLLM_LOGGING_LEVEL=DEBUG`. The parser reproduces that harness's numbers on the same log
   (see `tests/test_parse.py`).
-* **Four subcommands.** `run` (measure), `parse` (derive `profile.json`), `report` (waterfall +
-  verdict), `sleepwake` (measure sleep-mode warm start instead of a cold start).
+* **Five subcommands.** `run` (measure), `parse` (derive `profile.json`), `report` (waterfall +
+  verdict), `probe` (measure the box's disk/network ceilings and judge a profile against them),
+  `sleepwake` (measure sleep-mode warm start instead of a cold start).
 * **Per-stage system metrics.** `run` samples host network / disk / CPU / GPU counters at 1 Hz, and
   the report attributes each stage to what actually limited it — network-bound, disk-bound,
   single-core CPU-bound or GPU compute-bound.
@@ -61,6 +62,23 @@ Run dir (`<out>/<label>/run<N>/`): `events.jsonl`, `docker.log`, `inspect.json`,
 `--teardown`, so you can follow up with `sleepwake` or a throughput probe. Exit code is non-zero if
 the server never became ready or the sanity completion failed.
 
+`--prefetch <dir|glob>` (with `--prefetch-jobs`, default 8) warms the OS page cache by
+parallel-reading the weights **after** `--drop-caches` and **before** the container starts, so the
+engine's first read comes from RAM. It becomes a `prefetch` host span in the waterfall — counted in
+the total, with the bytes and rate it achieved — because it is real time you spent, and it only pays
+if it removes more from `weight_load` than it costs:
+
+```sh
+bin/spinup-profile run --image vllm/vllm-openai:v0.20.2 --port 8200 --gpus all --drop-caches \
+    --prefetch /mnt/nvme/models/Qwen3.5-27B-FP8 --prefetch-jobs 8 \
+    -- --port 8200 --model /mnt/nvme/models/Qwen3.5-27B-FP8 --max-model-len 262144
+```
+
+Measured on Verda 2×H100 with 31 GB of FP8 shards on local NVMe: 8 jobs warmed **31 GB in 8.4 s
+(3.7 GB/s)**, `weight_load` fell **62.9 s → 12.5 s**, and the whole spin-up went **162.2 s → 118.1 s
+including the prefetch** (−27 %). It is worth it exactly when `probe` shows your disk goes faster
+with parallel readers than with one — the report says so when it applies.
+
 While all that happens a background sampler writes host counters to `system.jsonl` at 1 Hz
 (`--sample-system` / `--no-sample-system`, default **on** when `/proc/net/dev` is readable;
 `--sample-interval` to change the rate). It starts before the image pull and stops once the sanity
@@ -77,8 +95,8 @@ bin/spinup-profile parse ~/runs/base-hf/run2 \
     --host-events ~/runs/bootstrap.jsonl --provision ~/runs/provision.json
 ```
 
-A run dir automatically uses `docker.log`, `meta.json`, `events.jsonl` and `provision.json` if
-present; a bare log file uses only what you pass. Without `meta.json` the timeline is anchored on
+A run dir automatically uses `docker.log`, `meta.json`, `events.jsonl`, `provision.json`,
+`system.jsonl` and `probe.json` if present; a bare log file uses only what you pass. Without `meta.json` the timeline is anchored on
 the first log line instead of container start (you get a warning saying so).
 
 ### 3. Render the waterfall and the verdict
@@ -141,7 +159,66 @@ network, **single-core CPU-bound** when CPU sits near `100 / nproc` % with the G
 compute-bound** at ≥ 50 % GPU utilisation. Network transmit and disk write are in the JSON and the
 totals line rather than the table, to keep it readable.
 
-### 4. Measure sleep-mode warm start (instead of a cold start)
+### 4. Measure the box's ceilings, and judge the stages against them
+
+A stage rate means nothing until you know what the hardware can do. `probe` measures the ceilings —
+ported from the field harness that ran on verda / nebius / lyceum / runpod — and with `--profile` it
+tells you, per stage, whether you are at the ceiling, leaving headroom on the table, or capped by the
+device itself.
+
+```sh
+# disk + network ceilings, saved next to a capture so `parse` picks them up
+bin/spinup-profile probe --target /mnt/nvme --out ~/runs/base-hf/run2/probe.json \
+    --profile ~/runs/base-hf/run2/profile.json
+
+bin/spinup-profile probe --target /mnt/nvme --size-mb 8192 --jobs 1,4,8      # disk only, bigger file
+bin/spinup-profile probe --no-disk --url https://host/big.bin --net-threads 8,32
+bin/spinup-profile probe --s3-env ~/.s3env --s3-prefix s3://bucket/Qwen3.5-27B-FP8 --no-disk --no-net
+```
+
+* **disk** — direct-IO write, then direct-IO reads at 1 / 4 / 8 parallel jobs (`--jobs`).
+* **network** — one HTTPS stream vs 4 / 16 / 32 parallel range-streams (`--net-threads`), ~20 s per
+  level (`--net-seconds`). Defaults to the Qwen3.5-27B-FP8 HF shards; `--url` (repeatable) overrides.
+* **object store** — optional `s5cmd --numworkers` sweep, when both `--s3-env` (a file of
+  `KEY=VALUE` credentials, including `AWS_ENDPOINT_URL`) and `--s3-prefix` are given.
+* Output is JSON lines on stdout (one per probe, like the shell original) followed by a human table;
+  `--out` writes the whole document, `--no-json` / `--no-table` pick one form.
+
+```
+ PROBE                                MB/s         GB    SECONDS
+ ---------------------------- ------------ ---------- ----------
+ disk_write_direct                   286.0       0.51        1.8
+ disk_read_direct_1job               397.7       0.51        1.3
+ disk_read_direct_4job               258.1       0.51        2.0
+ disk_read_direct_8job               256.5       0.51        2.0
+
+ CEILINGS: disk read 397.7 MB/s (1 job 397.7, does NOT scale with parallel readers)
+
+ OBSERVED PER-STAGE RATES vs THESE CEILINGS
+
+ STAGE                    SUBSYSTEM      OBSERVED     CEILING  HEADROOM  VERDICT
+ ------------------------ --------- ----------- ----------- --------- ----------------
+ weight_load              network        250.0 MB    385.0 MB      1.5x  underused-link
+ image_pull               network         44.0 MB    385.0 MB      8.8x  underused-link
+
+ * weight_load (network, 126s): only 65% of the measured ceiling, which parallel readers/streams
+   do reach — add concurrency (prefetch, runai_streamer, more streams)
+```
+
+Verdicts: **at-ceiling** (≥ 80 % of a ceiling that scales — only a faster source helps),
+**device-capped** (≥ 80 % of a ceiling that does *not* scale — change the transport, not the
+concurrency), **underused-link** (below the ceiling; if parallelism reaches it, parallelise).
+
+Ceilings measured with this suite on 2026-08-17, for context when reading your own numbers (MB/s):
+
+| Cloud | Disk read | Network | Note |
+|---|---|---|---|
+| Verda | 463 → 1,688 (4j) → **3,697** (8j) | 46 → **385** | local NVMe, scales hard with readers |
+| Nebius | **147**, flat | 90 → **992** | network disk is the wall; its own S3 beats its disk |
+| Lyceum | **400**, capped | **~121**, hard-capped | neither rewards concurrency |
+| RunPod | container NVMe 1,794 → **6,795**; network volume 871 → 1,393 | **~400** | volume is the slow path |
+
+### 5. Measure sleep-mode warm start (instead of a cold start)
 
 Requires a **running** server started with `VLLM_SERVER_DEV_MODE=1` **and** `--enable-sleep-mode`.
 
@@ -211,6 +288,7 @@ between a cold box and a warm one, provided you can afford to hold the GPU.
 | `host_gpu_ready` * | `boot_seen` → `gpu_ready` | driver up, `nvidia-smi` answers | provider image with the driver preinstalled |
 | `host_docker_ready` * | `gpu_ready` → `runtime_ready` | docker + nvidia container runtime usable | bake docker + nvidia-container-toolkit into the disk |
 | `image_pull` * | `pull_start` → `pull_done` | pulling the ~32 GiB vLLM image | bake the image into a boot disk / AMI / host cache |
+| `prefetch` * | `prefetch_start` → `prefetch_done` | page-cache warm-up of the weights (`--prefetch`) | only pays when the disk rewards parallel readers — see `probe` |
 | `launch_to_container` * | `t_launch` → container `StartedAt` | `docker run` accepted until the process exists | if this is big, an implicit pull is hiding in it |
 | `imports` | container start → `non-default args` | container launch + python/torch imports | image layers on local NVMe, warm page cache (~15–25 s is normal) |
 | `spawn_workers` | `non-default args` → engine-core wait | config resolution + EngineCore spawn | `VLLM_WORKER_MULTIPROC_METHOD=fork` (≈ −8 s) |
@@ -280,6 +358,8 @@ the same recipe reached ~220–290 s end-to-end.
 | `spans` | list | `{name, level, parent, start_s, end_s, dur_s, pct, t_start, t_end, source, axis, desc, sys}` |
 | `spans[].t_start/t_end` | float | absolute epochs, so a span can be lined up with any other time series |
 | `spans[].sys` | object | per-metric `{avg, peak}` for `net_rx_mbs`, `net_tx_mbs`, `disk_read_mbs`, `disk_write_mbs`, `cpu_pct`, `gpu_util_pct`, `gpu_mem_mib`, plus `samples` / `covered_s` (absent when nothing was sampled in that window) |
+| `spans[].bytes/gb/mbs/files/jobs` | number | on the `prefetch` span: what the warm-up actually read |
+| `ceilings` | object/null | from a `probe.json` in the run dir: `disk_read_1job_mbs`, `disk_read_best_mbs`, `disk_scales`, `net_single_mbs`, `net_parallel_best_mbs`, `net_best_mbs`, `net_scales`, `s3_best_mbs`, `source` |
 | `sys_summary` | object/null | `samples`, `window_s`, `net_rx_gb`, `net_tx_gb`, `disk_read_gb`, `disk_write_gb`, `peak_*`, `ifaces`, `disks`, `gpu_samples`, `cpu_count`, `hostname` |
 | `cache_hit` | bool | a torch.compile cache-hit marker was seen |
 | `cache_evidence` | object | `{hit_marker, store_marker, cache_dir}` — `store_marker` proves a miss |
@@ -306,6 +386,9 @@ The flat `span_*` / mark keys are deliberately reference-compatible with the res
   "instance_type": …}`. `t_requested`/`t_provision_start`/`t_create`/`t_start` and
   `t_ssh_ready`/`t_ssh_up`/`t_ssh_ok` are accepted as aliases. Write it from whatever provisions
   the box.
+* `probe.json` — output of `spinup-profile probe --out <run-dir>/probe.json` (`--probe-json` to
+  point elsewhere). Only its `ceilings` block is read, to turn "this stage ran at X MB/s" into "that
+  is 65 % of what this box can do".
 * `system.jsonl` — 1 Hz host counters (`--system-jsonl` to point elsewhere). One JSON object per
   line, **counters cumulative**, rates derived at parse time:
 
@@ -368,9 +451,16 @@ Patterns live in `spinup_profiler/patterns.py`; the span/leaf/hint model lives i
 python3 tests/test_parse.py
 python3 tests/test_sleepwake.py
 python3 tests/test_system.py
+python3 tests/test_probe.py
 ```
 
-All three are plain python, no pytest, and exit non-zero on failure.
+All four are plain python, no pytest, and exit non-zero on failure.
+
+`test_probe.py` needs no GPU and no internet: the disk probe runs for real on a temp dir with an 8 MB
+file, the network probe streams from an in-process HTTP server, `prefetch` is checked byte-for-byte
+against temp files (including that one huge file still splits across readers), and the
+ceilings-vs-profile verdicts are driven by a synthetic probe document — including that a run which
+already prefetches is *not* told to prefetch again.
 
 `test_system.py` writes a synthetic `system.jsonl` whose phases line up with the real example run's
 timeline (250 MB/s of network during `weight_load`, one busy core during `imports`, 90 % GPU during
@@ -409,6 +499,8 @@ spinup_profiler/
   sleepwake.py   `sleepwake` — sleep/wake/first-completion timing
   stages.py      the stage model: spans, leaves, descriptions, hints, attribution rules
   sysmetrics.py  system.jsonl: the 1 Hz sampler AND the rate maths that reads it back
+  probe.py       `probe` — disk / network / object-store ceilings + the headroom verdicts
+  prefetch.py    parallel page-cache warm-up for --prefetch
   httpc.py       urllib wrapper that never raises
   shell.py       subprocess + nvidia-smi helpers shared by run/sleepwake
 bin/spinup-profile      shim: PYTHONPATH + python3 -m spinup_profiler
@@ -416,6 +508,7 @@ examples/               real docker.log + meta.json + generated profile.json + r
 tests/test_parse.py     parser regression test against the example
 tests/test_sleepwake.py sleep-verification test against in-process fake servers
 tests/test_system.py    per-stage system metrics against a synthetic system.jsonl
+tests/test_probe.py     probe sections + prefetch + ceiling verdicts (no GPU, no internet)
 ```
 
 ## Gotchas
@@ -436,6 +529,17 @@ tests/test_system.py    per-stage system metrics against a synthetic system.json
   discarded). Level 1 is the number to quote.
 * **`cpu_busy_pct` is over all cores.** On a 32-core box one saturated core reads as ~3 %, which is
   why the single-core hint compares against `100 / nproc` rather than looking for 100 %.
+* **`s5cmd` does not support `[2-5]` character classes in wildcards.** The field script's
+  `...0000[2-5]-of-00011.safetensors` matched nothing and reported 0 bytes, so `probe` lists the
+  objects first and copies them by name (which also makes `--s3-cap-gb` exact). `s5cmd` is **not**
+  auto-installed — if it is missing the section reports a skip with the download hint.
+* **`probe` expects to be unprivileged sometimes.** No sudo or a read-only `/proc` (normal in a
+  container, hit on RunPod) means the page cache cannot be dropped: it says so and carries on, since
+  the direct-IO numbers do not depend on it. It never needs `bc` either — that is another thing
+  RunPod images lack.
+* **`--prefetch` is only worth it when the disk scales with parallel readers.** On a flat device
+  (Nebius network disk, Lyceum) you pay the warm-up and get nothing back. Run `probe` first; the
+  report only suggests prefetching when the measured ceilings support it.
 * **System metrics are host-wide, not container-scoped.** Anything else running on the box lands in
   the same counters. On a dedicated GPU box during a spin-up that is what you want; on a shared box,
   read the per-device breakdown in `system.jsonl` before trusting the attribution.

@@ -107,16 +107,17 @@ def read_provision(path):
     return out
 
 
-def resolve_inputs(target, meta=None, host_events=None, provision=None, system=None):
+def resolve_inputs(target, meta=None, host_events=None, provision=None, system=None, probe=None):
     """A run dir picks up its siblings; a bare log file uses only what is passed."""
     paths = {"log": None, "meta": meta, "host_events": host_events, "provision": provision,
-             "system": system}
+             "system": system, "probe": probe}
     if os.path.isdir(target):
         paths["log"] = os.path.join(target, "docker.log")
         for key, fname in (("meta", "meta.json"),
                            ("host_events", "events.jsonl"),
                            ("provision", "provision.json"),
-                           ("system", "system.jsonl")):
+                           ("system", "system.jsonl"),
+                           ("probe", "probe.json")):
             if paths[key] is None:
                 cand = os.path.join(target, fname)
                 if os.path.exists(cand):
@@ -190,8 +191,9 @@ def _fill_gaps(spans, start, end, level, parent, warnings, label):
 
 
 def build_profile(target, meta_path=None, host_events_path=None, provision_path=None,
-                  system_path=None):
-    paths = resolve_inputs(target, meta_path, host_events_path, provision_path, system_path)
+                  system_path=None, probe_path=None):
+    paths = resolve_inputs(target, meta_path, host_events_path, provision_path, system_path,
+                           probe_path)
     if not os.path.exists(paths["log"]):
         raise SystemExit("no docker log at %s" % paths["log"])
 
@@ -243,11 +245,15 @@ def build_profile(target, meta_path=None, host_events_path=None, provision_path=
     spans = []
 
     # host prefix (absolute epoch inputs, so they are placed before t0 in order)
-    def ev(name):
+    def ev_full(name):
         for e in host:
             if e["ev"] == name:
-                return e["t"]
+                return e
         return None
+
+    def ev(name):
+        e = ev_full(name)
+        return e["t"] if e else None
 
     host_pairs = []
     if prov.get("t_request") is not None:
@@ -260,6 +266,7 @@ def build_profile(target, meta_path=None, host_events_path=None, provision_path=
         ("host_gpu_ready", ev("boot_seen"), ev("gpu_ready")),
         ("host_docker_ready", ev("gpu_ready"), ev("runtime_ready") or ev("docker_ready")),
         ("image_pull", ev("pull_start"), ev("pull_done")),
+        ("prefetch", ev("prefetch_start"), ev("prefetch_done")),
         ("launch_to_container", meta.get("t_launch"), meta.get("t_container_start")),
     ]
     cursor = 0.0
@@ -269,6 +276,11 @@ def build_profile(target, meta_path=None, host_events_path=None, provision_path=
         dur = b - a
         s = _span(name, cursor, cursor + dur, 0, source="host", t_start=a, t_end=b)
         s["axis"] = "host"  # measured on the box, before the container timeline
+        if name == "prefetch":  # carry what was warmed, not just how long it took
+            payload = ev_full("prefetch_done") or {}
+            for key in ("bytes", "gb", "mbs", "files", "jobs", "segments"):
+                if payload.get(key) is not None:
+                    s[key] = payload[key]
         spans.append(s)
         cursor += dur
     host_prefix_s = round(cursor, 2)
@@ -361,6 +373,18 @@ def build_profile(target, meta_path=None, host_events_path=None, provision_path=
             warnings.append("could not merge %s: %s: %s"
                             % (paths["system"], type(e).__name__, e))
 
+    # measured resource ceilings from a `probe` run, if one was saved next to this capture
+    ceilings = None
+    if paths["probe"] and os.path.exists(paths["probe"]):
+        try:
+            with open(paths["probe"], errors="replace") as fh:
+                doc = json.load(fh)
+            ceilings = doc.get("ceilings") or None
+            if ceilings:
+                ceilings["source"] = os.path.abspath(paths["probe"])
+        except Exception as e:
+            warnings.append("could not read %s: %s: %s" % (paths["probe"], type(e).__name__, e))
+
     # cache-hit evidence
     hit = "compile_cache_hit" in abs_marks and abs_marks["compile_cache_hit"] is not None
     store = abs_marks.get("compile_cache_store") is not None
@@ -392,6 +416,7 @@ def build_profile(target, meta_path=None, host_events_path=None, provision_path=
         "marks": marks,
         "spans": spans,
         "sys_summary": sys_summary,
+        "ceilings": ceilings,
         "provision": {k: v for k, v in prov.items() if k != "raw"} or None,
         "host_events": [{"ev": e["ev"], "t": e["t"]} for e in host] or None,
         "sanity": ({"model": meta.get("sanity_model"), "ok": bool(meta.get("sanity_ok")),
@@ -430,9 +455,9 @@ def write_profile(profile, out_path):
 
 def cmd_parse(args):
     profile = build_profile(args.target, args.meta, args.host_events, args.provision,
-                            args.system_jsonl)
+                            args.system_jsonl, args.probe_json)
     paths = resolve_inputs(args.target, args.meta, args.host_events, args.provision,
-                           args.system_jsonl)
+                           args.system_jsonl, args.probe_json)
     out = args.out or os.path.join(paths["out_dir"], "profile.json")
     write_profile(profile, out)
     if args.quiet:

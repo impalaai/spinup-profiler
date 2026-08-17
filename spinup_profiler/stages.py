@@ -16,6 +16,7 @@ HOST_SPANS = [
     ("host_gpu_ready", "SSH up -> nvidia-smi answers (driver loaded)"),
     ("host_docker_ready", "GPU ready -> docker + nvidia runtime usable"),
     ("image_pull", "docker pull of the vLLM image (~32 GiB uncompressed)"),
+    ("prefetch", "parallel read of the weights to warm the page cache before launch"),
     ("launch_to_container", "`docker run` issued -> container process started"),
 ]
 
@@ -129,6 +130,9 @@ HINTS = {
     "image_pull":
         "image pull dominates (the vLLM image is ~32 GiB): bake it into a reusable boot disk, AMI or host "
         "image cache, or pre-pull it in parallel with weight staging.",
+    "prefetch":
+        "the page-cache warm-up itself is now the biggest stage: lower --prefetch-jobs or prefetch only "
+        "the shards the engine actually reads — it is only worth what it removes from weight_load.",
     "launch_to_container":
         "big gap between `docker run` and container start = an implicit docker pull — pre-pull or bake the image.",
     "imports":
@@ -171,6 +175,9 @@ HINTS = {
 }
 
 # --- system-metric attribution (needs a merged system.jsonl) ---------------------
+# Shared with probe.py, which judges observed rates against measured ceilings with the same numbers.
+AT_CEILING = 0.80           # observed/ceiling above this => the hardware is being used
+SCALES = 1.30               # parallel/single above this => the subsystem rewards concurrency
 NET_BOUND_FRACTION = 0.70   # stage avg rx this close to the run's peak rx => the link is the limit
 GPU_BUSY_PCT = 50.0         # gpu utilisation that counts as "the GPU is the one working"
 GPU_IDLE_PCT = 20.0
@@ -184,6 +191,26 @@ GPU_STAGES = ("warmup_kernels", "graph_capture", "compile", "mem_profile_tail", 
 def _avg(span, metric):
     v = (span.get("sys") or {}).get(metric)
     return v["avg"] if v else None
+
+
+def _prefetch_advice(profile, name, observed_mbs, spans_by_name):
+    """Suggest --prefetch when a disk-bound weight_load sits below a disk that scales."""
+    if name != "weight_load" or "prefetch" in spans_by_name:
+        return ""
+    cl = profile.get("ceilings") or {}
+    best, one = cl.get("disk_read_best_mbs"), cl.get("disk_read_1job_mbs")
+    if not cl.get("disk_scales") or not best or observed_mbs >= AT_CEILING * best:
+        return ""
+    span = spans_by_name.get(name) or {}
+    saving = ""
+    if span.get("dur_s") and observed_mbs:
+        would_be = span["dur_s"] * observed_mbs / best
+        saving = (" On the measured ceiling the same bytes would take ~%.0fs instead of %.0fs."
+                  % (would_be, span["dur_s"]))
+    return (" `probe` measured this disk at %s MB/s with parallel readers vs %s MB/s single-job, so "
+            "the device has more to give than this stage is taking: run with "
+            "`--prefetch <weights dir> --prefetch-jobs 8` to warm the page cache first (measured: "
+            "31 GB warmed in 8.4s, weight_load 62.9 -> 12.5s).%s" % (best, one, saving))
 
 
 def system_hints(profile, spans_by_name):
@@ -202,8 +229,10 @@ def system_hints(profile, spans_by_name):
         if span is None or rx is None:
             continue
         if rd is not None and rd > max(rx, 1.0):
-            out.append("%s is DISK-bound: %.0f MB/s read from disk vs %.0f MB/s off the network — "
-                       "the local device is the limit, not the link." % (name, rd, rx))
+            msg = ("%s is DISK-bound: %.0f MB/s read from disk vs %.0f MB/s off the network — "
+                   "the local device is the limit, not the link." % (name, rd, rx))
+            msg += _prefetch_advice(profile, name, rd, spans_by_name)
+            out.append(msg)
         elif peak_rx and rx >= NET_BOUND_FRACTION * peak_rx and rx > 1.0:
             out.append("%s is NETWORK-bound at %.0f MB/s (%.0f%% of the %.0f MB/s peak this run "
                        "ever reached) — the transport is the limit, so a faster source (same-region "
