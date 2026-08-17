@@ -1,0 +1,6 @@
+#!/usr/bin/env sh
+# spinup-profile — run the profiler straight from a checkout, no install step.
+# Copy the whole repo to the GPU box (scp -r / git clone) and call this.
+set -e
+here=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+PYTHONPATH="$here${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m spinup_profiler "$@"
