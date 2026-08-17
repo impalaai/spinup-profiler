@@ -428,8 +428,12 @@ def verdict_for(observed, ceiling, scales):
                              "device is throttling this stage" % (100 * ratio)
 
 
-def compare_to_profile(records, profile, min_dur_s=1.0, min_mbs=1.0):
-    """Per-stage observed rate vs the measured ceilings."""
+def compare_to_profile(records, profile, min_dur_s=1.0, min_mbs=10.0):
+    """Per-stage observed rate vs the measured ceilings.
+
+    Stages moving less than min_mbs are skipped: a stage doing 2 MB/s of metadata fetches is not
+    "underusing the link", it simply is not an IO stage, and listing it buries the real rows.
+    """
     cl = ceilings(records)
     rows = []
     for s in profile.get("spans") or []:
@@ -516,8 +520,9 @@ def render_comparison(cl, rows):
     L.append(" " + "-" * 24 + " " + "-" * 9 + " " + "-" * 11 + " " + "-" * 11 + " " + "-" * 9
              + "  " + "-" * 16)
     for r in sorted(rows, key=lambda r: -r["observed_mbs"]):
-        L.append(" %-24s %-9s %8.1f MB %8.1f MB %8s  %s" % (
-            r["stage"][:24], r["subsystem"], r["observed_mbs"], r["ceiling_mbs"] or 0.0,
+        L.append(" %-24s %-9s %8.1f MB %11s %8s  %s" % (
+            r["stage"][:24], r["subsystem"], r["observed_mbs"],
+            ("%.1f MB" % r["ceiling_mbs"]) if r["ceiling_mbs"] else "not measured",
             ("%.1fx" % r["headroom_x"]) if r["headroom_x"] else "-", r["verdict"]))
     L.append("")
     for r in sorted(rows, key=lambda r: -r["observed_mbs"]):
