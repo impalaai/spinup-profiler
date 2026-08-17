@@ -10,7 +10,7 @@ import re
 import sys
 import time
 
-from . import httpc
+from . import httpc, sysmetrics
 from .parse import build_profile, write_profile
 from .report import render
 from .shell import sh
@@ -239,6 +239,21 @@ def cmd_run(args):
             run=args.run_index, vllm_args=" ".join(args.vllm_args),
             docker=" ".join(docker), host=os.uname().nodename)
 
+    # System sampler. Started BEFORE the preflight pull (a superset of launch->sanity) so the
+    # image_pull span gets real network numbers too; stopped once the sanity completion is done.
+    sampler = None
+    want_sys = args.sample_system if args.sample_system is not None else sysmetrics.available()
+    if want_sys and not sysmetrics.available():
+        log("WARNING: --sample-system requested but /proc/net/dev is not readable — skipping")
+        want_sys = False
+    if want_sys:
+        sampler = sysmetrics.Sampler(os.path.join(out_dir, "system.jsonl"),
+                                     interval=args.sample_interval).start()
+        if sampler.stopped_early:
+            log("WARNING: system sampler did not start (%s)" % sampler.stopped_early)
+        else:
+            ev.emit("sysmetrics_start", interval_s=args.sample_interval)
+
     host_info = host_preflight(ev, docker, args.image, not args.no_pull)
 
     rc, out, _e = sh(docker + ["rm", "-f", args.container], timeout=300)
@@ -274,6 +289,12 @@ def cmd_run(args):
             else:
                 log("sanity completion ok in %.2fs" % (sanity["t_ok"] - sanity["t_start"]))
 
+    if sampler is not None:
+        sampler.stop()
+        ev.emit("sysmetrics_stop", ticks=sampler.ticks, stopped_early=sampler.stopped_early)
+        if sampler.stopped_early:
+            log("WARNING: system sampler stopped early (%s)" % sampler.stopped_early)
+
     # capture artefacts
     log_path = os.path.join(out_dir, "docker.log")
     rc, out, err = sh(docker + ["logs", "-t", args.container], timeout=600)
@@ -306,8 +327,10 @@ def cmd_run(args):
         "drop_caches": bool(args.drop_caches),
         "timeout": args.timeout,
         "host": os.uname().nodename,
+        "cpu_count": os.cpu_count(),
         "ready_error": ready_err,
         "profiler": "spinup-profiler run",
+        "sysmetrics_ticks": sampler.ticks if sampler else 0,
     }
     meta.update({k: v for k, v in host_info.items()})
     if sanity:
@@ -336,7 +359,10 @@ def cmd_run(args):
     with open(os.path.join(out_dir, "report.txt"), "w") as fh:
         fh.write(text + "\n")
     print(text)
-    print("\nwrote %s/{events.jsonl,docker.log,meta.json,profile.json,report.txt}" % out_dir)
+    artefacts = "events.jsonl,docker.log,meta.json,profile.json,report.txt"
+    if sampler is not None and sampler.ticks:
+        artefacts += ",system.jsonl"
+    print("\nwrote %s/{%s}" % (out_dir, artefacts))
     if ready_err:
         return 1
     if sanity and not sanity["ok"]:

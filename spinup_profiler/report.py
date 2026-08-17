@@ -46,10 +46,59 @@ def hints_for(profile, top):
         if h:
             out.append("%s (%.1fs, %.0f%%): %s" % (s["name"], s["dur_s"], s["pct"] or 0.0, h))
     out += stages.composite_hints(profile, dur)
+    # Attribution from the sampled counters. Only the finest partition, so a refined parent
+    # (engine_init) does not repeat what its leaves already said, and only stages worth naming.
+    by_name = {s["name"]: s for s in leaf_spans(profile) if s["dur_s"] >= 1.0}
+    out += stages.system_hints(profile, by_name)
     return out
 
 
-def render(profile, width=44, top_n=3, show_hints=True):
+def _pair(sysdata, metric, fmt="%.1f"):
+    """'avg / peak' for one metric, or a dash when it was not sampled."""
+    v = (sysdata or {}).get(metric)
+    if not v:
+        return "-"
+    return (fmt + " / " + fmt) % (v["avg"], v["peak"])
+
+
+def io_table(profile, width=None):
+    """Per-stage system metrics: what the box was doing during each stage."""
+    spans = [s for s in (profile.get("spans") or []) if s.get("sys")]
+    if not spans:
+        return []
+    summary = profile.get("sys_summary") or {}
+    L = ["", " PER-STAGE SYSTEM METRICS   avg / peak   (MB = 1e6 bytes; cpu%% over all %s cores)"
+         % (summary.get("cpu_count") or "?")]
+    head = " %-*s %15s %15s %13s %11s" % (NAME_W, "STAGE", "NET RX MB/s",
+                                          "DISK RD MB/s", "CPU %", "GPU %")
+    L.append(head)
+    L.append(" " + "-" * NAME_W + " " + "-" * 15 + " " + "-" * 15 + " " + "-" * 13 + " " + "-" * 11)
+    for s in sorted(spans, key=lambda s: (s["start_s"], s["level"])):
+        label = ("  |- " if s["level"] else " ") + s["name"]
+        L.append(" %-*s %15s %15s %13s %11s" % (
+            NAME_W, label[:NAME_W],
+            _pair(s["sys"], "net_rx_mbs"), _pair(s["sys"], "disk_read_mbs"),
+            _pair(s["sys"], "cpu_pct"), _pair(s["sys"], "gpu_util_pct", "%.0f")))
+    totals = []
+    for key, label in (("net_rx_gb", "net in"), ("net_tx_gb", "net out"),
+                       ("disk_read_gb", "disk read"), ("disk_write_gb", "disk written")):
+        if summary.get(key) is not None:
+            totals.append("%s %.2f GB" % (label, summary[key]))
+    if totals:
+        L.append(" totals over %ss of sampling: %s" % (summary.get("window_s"), "   ".join(totals)))
+    where = []
+    if summary.get("ifaces"):
+        where.append("ifaces %s" % ",".join(summary["ifaces"]))
+    if summary.get("disks"):
+        where.append("disks %s" % ",".join(summary["disks"]))
+    if summary.get("gpu_samples"):
+        where.append("%d gpu samples" % summary["gpu_samples"])
+    if where:
+        L.append(" sampled: %s" % "   ".join(where))
+    return L
+
+
+def render(profile, width=44, top_n=3, show_hints=True, show_io=True):
     L = []
     name = profile.get("name") or os.path.basename(os.path.dirname(profile.get("log") or "")) or "run"
     run = profile.get("run")
@@ -123,6 +172,9 @@ def render(profile, width=44, top_n=3, show_hints=True):
         L.append(" vLLM's own claims: %s" % "  ".join(
             "%s=%.2fs" % (k.replace("_claimed", ""), v) for k, v in profile["claimed"].items()))
 
+    if show_io:
+        L += io_table(profile)
+
     if show_hints:
         hs = hints_for(profile, top)
         if hs:
@@ -167,7 +219,8 @@ def cmd_report(args):
     profile = load(args.profile)
     if profile.get("schema") != "spinup-profiler/profile/v1":
         print("warning: unexpected schema %r — rendering anyway" % profile.get("schema"))
-    text = render(profile, width=args.width, top_n=args.top, show_hints=not args.no_hints)
+    text = render(profile, width=args.width, top_n=args.top, show_hints=not args.no_hints,
+                  show_io=not args.no_io)
     print(text)
     if args.out:
         with open(args.out, "w") as fh:

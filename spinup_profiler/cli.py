@@ -53,6 +53,13 @@ def build_parser():
                    help="do not inject VLLM_LOGGING_LEVEL=DEBUG etc (the compile/graph marks then disappear)")
     r.add_argument("--drop-caches", action="store_true",
                    help="sync + drop the host page cache before launch (needs passwordless sudo)")
+    r.add_argument("--sample-system", dest="sample_system", action="store_true", default=None,
+                   help="sample host net/disk/cpu/gpu counters into system.jsonl "
+                        "(default: on when /proc/net/dev is readable)")
+    r.add_argument("--no-sample-system", dest="sample_system", action="store_false",
+                   help="do not sample host system metrics")
+    r.add_argument("--sample-interval", type=float, default=1.0,
+                   help="system sampling interval in seconds (default 1.0)")
     r.add_argument("--no-pull", action="store_true",
                    help="skip the timed pre-pull; docker run will pull implicitly instead")
     r.add_argument("--timeout", type=int, default=1800, help="seconds to wait for /health (default 1800)")
@@ -83,6 +90,8 @@ def build_parser():
     q.add_argument("--meta", default=None, help="meta.json (default <run-dir>/meta.json)")
     q.add_argument("--host-events", default=None, help="events.jsonl (default <run-dir>/events.jsonl)")
     q.add_argument("--provision", default=None, help="provision.json (default <run-dir>/provision.json)")
+    q.add_argument("--system-jsonl", default=None,
+                   help="system.jsonl of host counters (default <run-dir>/system.jsonl)")
     q.add_argument("--out", default=None, help="output path (default <run-dir>/profile.json)")
     q.add_argument("--quiet", action="store_true", help="print only the output path, no report")
     q.add_argument("--width", type=int, default=44, help="waterfall bar columns (default 44)")
@@ -93,6 +102,8 @@ def build_parser():
     o.add_argument("--width", type=int, default=44, help="waterfall bar columns (default 44)")
     o.add_argument("--top", type=int, default=3, help="how many stages to rank (default 3)")
     o.add_argument("--no-hints", action="store_true", help="omit the per-stage hints")
+    o.add_argument("--no-io", action="store_true",
+                   help="omit the per-stage system-metrics table")
     o.add_argument("--out", default=None, help="also write the rendered report here")
 
     # ---------------------------------------------------------------- sleepwake

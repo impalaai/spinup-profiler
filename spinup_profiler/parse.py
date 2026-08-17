@@ -4,7 +4,7 @@ import json
 import os
 import time
 
-from . import stages
+from . import stages, sysmetrics
 from .patterns import MULTI_PATTERNS, PATTERNS, TS_RE, ts
 
 SCHEMA = "spinup-profiler/profile/v1"
@@ -107,14 +107,16 @@ def read_provision(path):
     return out
 
 
-def resolve_inputs(target, meta=None, host_events=None, provision=None):
+def resolve_inputs(target, meta=None, host_events=None, provision=None, system=None):
     """A run dir picks up its siblings; a bare log file uses only what is passed."""
-    paths = {"log": None, "meta": meta, "host_events": host_events, "provision": provision}
+    paths = {"log": None, "meta": meta, "host_events": host_events, "provision": provision,
+             "system": system}
     if os.path.isdir(target):
         paths["log"] = os.path.join(target, "docker.log")
         for key, fname in (("meta", "meta.json"),
                            ("host_events", "events.jsonl"),
-                           ("provision", "provision.json")):
+                           ("provision", "provision.json"),
+                           ("system", "system.jsonl")):
             if paths[key] is None:
                 cand = os.path.join(target, fname)
                 if os.path.exists(cand):
@@ -127,7 +129,7 @@ def resolve_inputs(target, meta=None, host_events=None, provision=None):
 
 
 # --------------------------------------------------------------------------- spans
-def _span(name, start_s, end_s, level, parent=None, source="log"):
+def _span(name, start_s, end_s, level, parent=None, source="log", t_start=None, t_end=None):
     return {
         "name": name,
         "level": level,
@@ -135,6 +137,9 @@ def _span(name, start_s, end_s, level, parent=None, source="log"):
         "start_s": round(start_s, 2),
         "end_s": round(end_s, 2),
         "dur_s": round(end_s - start_s, 2),
+        # absolute epochs: host spans carry their measured ones, container spans get them from t0
+        "t_start": round(t_start, 3) if t_start else None,
+        "t_end": round(t_end, 3) if t_end else None,
         "source": source,
         "desc": stages.describe(name),
     }
@@ -184,8 +189,9 @@ def _fill_gaps(spans, start, end, level, parent, warnings, label):
     return filled
 
 
-def build_profile(target, meta_path=None, host_events_path=None, provision_path=None):
-    paths = resolve_inputs(target, meta_path, host_events_path, provision_path)
+def build_profile(target, meta_path=None, host_events_path=None, provision_path=None,
+                  system_path=None):
+    paths = resolve_inputs(target, meta_path, host_events_path, provision_path, system_path)
     if not os.path.exists(paths["log"]):
         raise SystemExit("no docker log at %s" % paths["log"])
 
@@ -261,7 +267,7 @@ def build_profile(target, meta_path=None, host_events_path=None, provision_path=
         if a is None or b is None or b <= a:
             continue
         dur = b - a
-        s = _span(name, cursor, cursor + dur, 0, source="host")
+        s = _span(name, cursor, cursor + dur, 0, source="host", t_start=a, t_end=b)
         s["axis"] = "host"  # measured on the box, before the container timeline
         spans.append(s)
         cursor += dur
@@ -327,6 +333,33 @@ def build_profile(target, meta_path=None, host_events_path=None, provision_path=
     total_profiled_s = round(sum(s["dur_s"] for s in spans if s["level"] == 0), 2)
     for s in spans:
         s["pct"] = round(100.0 * s["dur_s"] / total_profiled_s, 2) if total_profiled_s else None
+        if s["t_start"] is None and s.get("axis") == "container":
+            s["t_start"] = round(t0 + s["start_s"] - host_prefix_s, 3)
+            s["t_end"] = round(t0 + s["end_s"] - host_prefix_s, 3)
+
+    # per-span system metrics (network / disk / cpu / gpu), if a system.jsonl was captured
+    sys_summary = None
+    if paths["system"] and os.path.exists(paths["system"]):
+        try:
+            sys_meta, samples = sysmetrics.read_samples(paths["system"])
+            if not samples:
+                warnings.append("system.jsonl has no usable samples")
+            else:
+                if not sys_meta.get("cpu_count") and meta.get("cpu_count"):
+                    sys_meta["cpu_count"] = meta["cpu_count"]
+                series = sysmetrics.build_series(samples)
+                for s in spans:
+                    st = sysmetrics.window_stats(series, s["t_start"], s["t_end"])
+                    if st:
+                        s["sys"] = st
+                sys_summary = sysmetrics.summarize(series, sys_meta)
+                uncovered = [s["name"] for s in spans if s["level"] == 0 and "sys" not in s]
+                if uncovered:
+                    warnings.append("no system samples cover %s — the sampler was not running "
+                                    "for that part of the timeline" % ", ".join(uncovered))
+        except Exception as e:  # a bad system.jsonl must not lose the whole profile
+            warnings.append("could not merge %s: %s: %s"
+                            % (paths["system"], type(e).__name__, e))
 
     # cache-hit evidence
     hit = "compile_cache_hit" in abs_marks and abs_marks["compile_cache_hit"] is not None
@@ -358,6 +391,7 @@ def build_profile(target, meta_path=None, host_events_path=None, provision_path=
         "claimed": {k: v for k, v in sorted(values.items()) if k.endswith("_claimed")},
         "marks": marks,
         "spans": spans,
+        "sys_summary": sys_summary,
         "provision": {k: v for k, v in prov.items() if k != "raw"} or None,
         "host_events": [{"ev": e["ev"], "t": e["t"]} for e in host] or None,
         "sanity": ({"model": meta.get("sanity_model"), "ok": bool(meta.get("sanity_ok")),
@@ -395,8 +429,10 @@ def write_profile(profile, out_path):
 
 
 def cmd_parse(args):
-    profile = build_profile(args.target, args.meta, args.host_events, args.provision)
-    paths = resolve_inputs(args.target, args.meta, args.host_events, args.provision)
+    profile = build_profile(args.target, args.meta, args.host_events, args.provision,
+                            args.system_jsonl)
+    paths = resolve_inputs(args.target, args.meta, args.host_events, args.provision,
+                           args.system_jsonl)
     out = args.out or os.path.join(paths["out_dir"], "profile.json")
     write_profile(profile, out)
     if args.quiet:

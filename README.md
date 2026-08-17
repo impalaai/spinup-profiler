@@ -13,6 +13,9 @@ the bottleneck — plus the lever that shortened it in the IMP-2773 research.
   (see `tests/test_parse.py`).
 * **Four subcommands.** `run` (measure), `parse` (derive `profile.json`), `report` (waterfall +
   verdict), `sleepwake` (measure sleep-mode warm start instead of a cold start).
+* **Per-stage system metrics.** `run` samples host network / disk / CPU / GPU counters at 1 Hz, and
+  the report attributes each stage to what actually limited it — network-bound, disk-bound,
+  single-core CPU-bound or GPU compute-bound.
 
 ```
 git clone git@github.com:impalaai/spinup-profiler.git
@@ -54,9 +57,16 @@ Everything after `--` is passed to the container verbatim. What `run` does, in o
 6. captures `docker logs -t` + `docker inspect`, writes the run dir, then parses and reports.
 
 Run dir (`<out>/<label>/run<N>/`): `events.jsonl`, `docker.log`, `inspect.json`, `meta.json`,
-`profile.json`, `report.txt`. The container is left **running** unless you pass `--teardown`, so
-you can follow up with `sleepwake` or a throughput probe. Exit code is non-zero if the server
-never became ready or the sanity completion failed.
+`system.jsonl`, `profile.json`, `report.txt`. The container is left **running** unless you pass
+`--teardown`, so you can follow up with `sleepwake` or a throughput probe. Exit code is non-zero if
+the server never became ready or the sanity completion failed.
+
+While all that happens a background sampler writes host counters to `system.jsonl` at 1 Hz
+(`--sample-system` / `--no-sample-system`, default **on** when `/proc/net/dev` is readable;
+`--sample-interval` to change the rate). It starts before the image pull and stops once the sanity
+completion is done, so every stage — including `image_pull` — gets network/disk/CPU/GPU numbers.
+Every tick is wrapped in `try/except`: a sampler that cannot read a counter drops that field, and
+one that fails repeatedly stops itself and records why. It can never fail the run.
 
 ### 2. Re-parse a capture you already have
 
@@ -99,6 +109,37 @@ See `examples/report.txt` for the full output. Abridged:
 `engine_init` is shown twice: once as the level-0 span it is, then broken into the level-1 leaves
 that partition it. The verdict ranks the **finest** partition, so `engine_init` never wins as a
 lump — you get told which part of it is the problem.
+
+When a `system.jsonl` was captured, the report also prints what the box was *doing* during each
+stage and attributes the bottleneck to a subsystem (`--no-io` to omit the table):
+
+```
+ PER-STAGE SYSTEM METRICS   avg / peak   (MB = 1e6 bytes; cpu% over all 32 cores)
+ STAGE                              NET RX MB/s    DISK RD MB/s         CPU %       GPU %
+ ------------------------------ --------------- --------------- ------------- -----------
+  imports                             0.0 / 0.0       0.0 / 0.0     3.1 / 3.1      0 / 0
+  weight_load                     248.5 / 250.0     49.7 / 50.0   25.0 / 40.0      0 / 0
+   |- compile                         0.0 / 0.0       0.0 / 0.0   39.4 / 40.0    10 / 10
+   |- warmup_kernels                  0.0 / 0.0       0.0 / 0.0   12.0 / 12.0    90 / 90
+ totals over 471.0s of sampling: net in 31.32 GB   net out 0.02 GB   disk read 6.25 GB   disk written 31.25 GB
+ sampled: ifaces eth0   disks nvme0n1   236 gpu samples
+
+  * weight_load is NETWORK-bound at 249 MB/s (99% of the 250 MB/s peak this run ever reached) —
+    the transport is the limit, so a faster source (same-region object storage, runai_streamer)
+    is the only lever.
+  * imports is single-core CPU-bound: 3.1% of 32 cores is ~1 core saturated (1 core = 3.1%) with
+    the GPU idle — this work does not parallelise, ...
+  * warmup_kernels is GPU compute-bound at 90% utilisation — expected for kernel autotune/capture;
+    the lever is doing it once and caching it, not faster IO.
+  * compile is CPU-bound (inductor) with the GPU at 10% — more/faster cores or a warm
+    VLLM_CACHE_ROOT are the only levers.
+```
+
+Attribution rules: a stage is **network-bound** when its average receive rate is within 70 % of the
+fastest rate anywhere in the run, **disk-bound** when it reads from disk faster than from the
+network, **single-core CPU-bound** when CPU sits near `100 / nproc` % with the GPU idle, and **GPU
+compute-bound** at ≥ 50 % GPU utilisation. Network transmit and disk write are in the JSON and the
+totals line rather than the table, to keep it readable.
 
 ### 4. Measure sleep-mode warm start (instead of a cold start)
 
@@ -236,7 +277,10 @@ the same recipe reached ~220–290 s end-to-end.
 | `total_profiled_s` | float | sum of every level-0 span (host prefix + container + tail) |
 | `host_prefix_s` | float/null | total of the host spans, or null |
 | `marks` | {str: float\|null} | absolute timeline, seconds from `t0`, one entry per pattern |
-| `spans` | list | `{name, level, parent, start_s, end_s, dur_s, pct, source, axis, desc}` |
+| `spans` | list | `{name, level, parent, start_s, end_s, dur_s, pct, t_start, t_end, source, axis, desc, sys}` |
+| `spans[].t_start/t_end` | float | absolute epochs, so a span can be lined up with any other time series |
+| `spans[].sys` | object | per-metric `{avg, peak}` for `net_rx_mbs`, `net_tx_mbs`, `disk_read_mbs`, `disk_write_mbs`, `cpu_pct`, `gpu_util_pct`, `gpu_mem_mib`, plus `samples` / `covered_s` (absent when nothing was sampled in that window) |
+| `sys_summary` | object/null | `samples`, `window_s`, `net_rx_gb`, `net_tx_gb`, `disk_read_gb`, `disk_write_gb`, `peak_*`, `ifaces`, `disks`, `gpu_samples`, `cpu_count`, `hostname` |
 | `cache_hit` | bool | a torch.compile cache-hit marker was seen |
 | `cache_evidence` | object | `{hit_marker, store_marker, cache_dir}` — `store_marker` proves a miss |
 | `weights_gib`, `kv_tokens`, `kv_mem_gib` | float/int | model facts vLLM reported |
@@ -262,6 +306,25 @@ The flat `span_*` / mark keys are deliberately reference-compatible with the res
   "instance_type": …}`. `t_requested`/`t_provision_start`/`t_create`/`t_start` and
   `t_ssh_ready`/`t_ssh_up`/`t_ssh_ok` are accepted as aliases. Write it from whatever provisions
   the box.
+* `system.jsonl` — 1 Hz host counters (`--system-jsonl` to point elsewhere). One JSON object per
+  line, **counters cumulative**, rates derived at parse time:
+
+  ```json
+  {"t": 1786983364.71, "meta": {"cpu_count": 32, "hostname": "gpu-1", "interval_s": 1.0}}
+  {"t": 1786983365.71,
+   "net":  {"eth0": {"rx_bytes": 12345, "tx_bytes": 678}},
+   "disk": {"nvme0n1": {"read_bytes": 4096, "write_bytes": 8192}},
+   "cpu_busy_pct": 12.5,
+   "gpu": [{"util_pct": 0, "mem_mib": 3}]}
+  ```
+
+  Sources are `/proc/net/dev` (skipping `lo`), `/proc/diskstats` (sectors × 512, skipping
+  `loop*`/`ram*`/`dm-*`/`zram*`), `/proc/stat` (busy/total delta, so the first line has no
+  `cpu_busy_pct`) and `nvidia-smi --query-gpu=utilization.gpu,memory.used` every 2nd tick — absent
+  `nvidia-smi` simply drops the `gpu` key. When **aggregating**, `parse` additionally excludes
+  virtual interfaces (`veth*`, `docker*`, `br-*`, `tun*`, `wg*`, `tailscale*`, …) and partitions
+  whose parent disk is present, because both would double-count bytes the physical device already
+  reported. The raw per-device numbers stay in the file.
 
 ---
 
@@ -304,9 +367,17 @@ Patterns live in `spinup_profiler/patterns.py`; the span/leaf/hint model lives i
 ```sh
 python3 tests/test_parse.py
 python3 tests/test_sleepwake.py
+python3 tests/test_system.py
 ```
 
-Both are plain python, no pytest, and exit non-zero on failure.
+All three are plain python, no pytest, and exit non-zero on failure.
+
+`test_system.py` writes a synthetic `system.jsonl` whose phases line up with the real example run's
+timeline (250 MB/s of network during `weight_load`, one busy core during `imports`, 90 % GPU during
+`warmup_kernels`, …), then asserts the derived per-span rates, that virtual interfaces and
+partitions are excluded from the aggregate, that the IO table renders, and that each stage gets the
+right bottleneck attribution. It also runs the real sampler for a moment to prove it writes what the
+reader expects. No GPU needed.
 
 `test_sleepwake.py` stands up three throwaway HTTP servers in-process and asserts the sleep
 verification behaves: a server that answers `/sleep` 200 without sleeping must fail with an error
@@ -336,13 +407,15 @@ spinup_profiler/
   parse.py       `parse` — marks -> spans -> profile.json
   report.py      `report` — ASCII waterfall, top-3, BOTTLENECK line, hints
   sleepwake.py   `sleepwake` — sleep/wake/first-completion timing
-  stages.py      the stage model: spans, leaves, descriptions, hints
+  stages.py      the stage model: spans, leaves, descriptions, hints, attribution rules
+  sysmetrics.py  system.jsonl: the 1 Hz sampler AND the rate maths that reads it back
   httpc.py       urllib wrapper that never raises
   shell.py       subprocess + nvidia-smi helpers shared by run/sleepwake
 bin/spinup-profile      shim: PYTHONPATH + python3 -m spinup_profiler
 examples/               real docker.log + meta.json + generated profile.json + report.txt
 tests/test_parse.py     parser regression test against the example
 tests/test_sleepwake.py sleep-verification test against in-process fake servers
+tests/test_system.py    per-stage system metrics against a synthetic system.jsonl
 ```
 
 ## Gotchas
@@ -361,6 +434,11 @@ tests/test_sleepwake.py sleep-verification test against in-process fake servers
   which is exactly the false positive the `/is_sleeping` verification now catches.
 * **Sleep level 2 is unvalidated on v0.20.2** (`reload_weights` → 500, weights apparently not
   discarded). Level 1 is the number to quote.
+* **`cpu_busy_pct` is over all cores.** On a 32-core box one saturated core reads as ~3 %, which is
+  why the single-core hint compares against `100 / nproc` rather than looking for 100 %.
+* **System metrics are host-wide, not container-scoped.** Anything else running on the box lands in
+  the same counters. On a dedicated GPU box during a spin-up that is what you want; on a shared box,
+  read the per-device breakdown in `system.jsonl` before trusting the attribution.
 
 Research background: "Minimizing vLLM Spin-Up Time" (July 2026) and the cross-cloud spin-up
 benchmark (August 2026). Ticket: **IMP-2773**.

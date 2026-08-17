@@ -170,6 +170,74 @@ HINTS = {
         "request before declaring the box in service.",
 }
 
+# --- system-metric attribution (needs a merged system.jsonl) ---------------------
+NET_BOUND_FRACTION = 0.70   # stage avg rx this close to the run's peak rx => the link is the limit
+GPU_BUSY_PCT = 50.0         # gpu utilisation that counts as "the GPU is the one working"
+GPU_IDLE_PCT = 20.0
+SINGLE_CORE_LO, SINGLE_CORE_HI = 0.70, 1.45   # multiples of (100 / cpu_count)
+
+NET_STAGES = ("weight_load", "image_pull", "pre_load", "api_startup")
+CPU_STAGES = ("imports", "spawn_workers", "pre_load", "compile")
+GPU_STAGES = ("warmup_kernels", "graph_capture", "compile", "mem_profile_tail", "engine_init")
+
+
+def _avg(span, metric):
+    v = (span.get("sys") or {}).get(metric)
+    return v["avg"] if v else None
+
+
+def system_hints(profile, spans_by_name):
+    """Attribute the expensive stages to network / disk / CPU / GPU using the sampled counters."""
+    summary = profile.get("sys_summary")
+    if not summary:
+        return []
+    out = []
+    peak_rx = summary.get("peak_net_rx_mbs") or 0.0
+    cpu_count = summary.get("cpu_count")
+    one_core = (100.0 / cpu_count) if cpu_count else None
+
+    for name in NET_STAGES:
+        span = spans_by_name.get(name)
+        rx, rd = _avg(span or {}, "net_rx_mbs"), _avg(span or {}, "disk_read_mbs")
+        if span is None or rx is None:
+            continue
+        if rd is not None and rd > max(rx, 1.0):
+            out.append("%s is DISK-bound: %.0f MB/s read from disk vs %.0f MB/s off the network — "
+                       "the local device is the limit, not the link." % (name, rd, rx))
+        elif peak_rx and rx >= NET_BOUND_FRACTION * peak_rx and rx > 1.0:
+            out.append("%s is NETWORK-bound at %.0f MB/s (%.0f%% of the %.0f MB/s peak this run "
+                       "ever reached) — the transport is the limit, so a faster source (same-region "
+                       "object storage, runai_streamer) is the only lever."
+                       % (name, rx, 100.0 * rx / peak_rx, peak_rx))
+
+    if one_core:
+        for name in CPU_STAGES:
+            span = spans_by_name.get(name)
+            cpu, gpu = _avg(span or {}, "cpu_pct"), _avg(span or {}, "gpu_util_pct")
+            if span is None or cpu is None:
+                continue
+            if (SINGLE_CORE_LO * one_core <= cpu <= SINGLE_CORE_HI * one_core
+                    and (gpu is None or gpu < GPU_IDLE_PCT)):
+                out.append("%s is single-core CPU-bound: %.1f%% of %d cores is ~1 core saturated "
+                           "(1 core = %.1f%%) with the GPU idle — this work does not parallelise, "
+                           "so only a faster core or less work (warm cache, fewer imports) helps."
+                           % (name, cpu, cpu_count, one_core))
+
+    for name in GPU_STAGES:
+        span = spans_by_name.get(name)
+        gpu = _avg(span or {}, "gpu_util_pct")
+        if span is None or gpu is None:
+            continue
+        if gpu >= GPU_BUSY_PCT:
+            out.append("%s is GPU compute-bound at %.0f%% utilisation — expected for kernel "
+                       "autotune/capture; the lever is doing it once and caching it, not faster IO."
+                       % (name, gpu))
+        elif name == "compile" and gpu < GPU_IDLE_PCT:
+            out.append("compile is CPU-bound (inductor) with the GPU at %.0f%% — more/faster cores "
+                       "or a warm VLLM_CACHE_ROOT are the only levers." % gpu)
+    return out
+
+
 # Composite rules: (predicate(profile, by_name) -> bool, hint)
 def composite_hints(profile, dur):
     """Extra hints that depend on more than one span. `dur` maps span name -> seconds."""
