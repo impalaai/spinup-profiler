@@ -1,0 +1,58 @@
+==============================================================================
+ vLLM SPIN-UP PROFILE   base-hf run 2
+==============================================================================
+ image             vllm/vllm-openai:v0.20.2
+ vllm args         --port 8200 --model Qwen/Qwen3.5-27B-FP8 --served-model-name Qwen/Qwen3.5-27B-FP8 --max-model-len 262144 --reasoning-parser qwen3 --max-num-seqs 256
+ container->ready  470.06 s   (t0 = meta.t_container_start)
+ host prefix       0.31 s   (host spans measured before the container timeline)
+ profiled total    470.37 s
+ torch.compile     cache MISS   dir /root/.cache/vllm/torch_compile_cache/0c9020ddb5/rank_0_0/backbone
+ model             weights 28.54 GiB   KV cache 669,320 tokens
+
+ STAGE                             START      DUR      %  SHARE OF TOTAL
+ ------------------------------ -------- -------- ------  --------------------------------------------
+  launch_to_container *             0.00     0.31   0.1%  :
+  imports                           0.31    20.99   4.5%  ##
+  spawn_workers                    21.30    40.90   8.7%  ####
+  pre_load                         62.20    15.69   3.3%  #
+  weight_load                      77.89   125.75  26.7%  ############
+  engine_init                     203.64   242.54  51.6%  #######################
+   |- engine_pre_compile          203.64     1.42   0.3%  :
+   |- compile                     205.06    49.21  10.5%  #####
+   |- mem_profile_tail            254.27    57.49  12.2%  #####
+   |- warmup_kernels              311.76   114.94  24.4%  ###########
+   |- graph_capture               426.70    19.45   4.1%  ##
+   |- engine_init_tail            446.15     0.03   0.0%  :
+  api_startup                     446.18    23.96   5.1%  ##
+  ready_to_health                 470.14     0.23   0.1%  :
+ ------------------------------ -------- -------- ------  --------------------------------------------
+ TOTAL (level-0 spans)                     470.37 100.0%
+ * host span: measured on the box, before the container timeline.
+
+ TOP 3 STAGES (finest partition)
+  1. weight_load                      125.75 s   26.7%   model weight transport + placement on the GPU
+  2. warmup_kernels                   114.94 s   24.4%   model warm-up after KV allocation — mostly kernel autotune/compile (cacheable)
+  3. mem_profile_tail                  57.49 s   12.2%   rest of memory profiling incl. cudagraph memory estimation, until the KV cache is sized
+
+ BOTTLENECK: weight_load (125.8s, 27% of 470.4s)
+
+ vLLM's own claims: compile_done=49.21s  graphs_done=20.00s  init_engine_done=242.53s  mem_profile=107.80s  weights_done=124.86s
+
+ HINTS
+  * weight_load (125.8s, 27%): weight transport dominates: try runai_streamer
+    from same-region object storage (~1.4 GB/s measured) or local NVMe; HF hub
+    cold-CDN is the slow path; see IMP-2773 research.
+  * warmup_kernels (114.9s, 24%): post-KV warm-up dominates: this is mostly
+    (cacheable) kernel autotune/compile, not graph capture — persist
+    VLLM_CACHE_ROOT; --enforce-eager will NOT remove it.
+  * mem_profile_tail (57.5s, 12%): memory profiling dominates: it re-runs
+    compiled/estimated forwards — a warm torch.compile cache (persisted
+    VLLM_CACHE_ROOT) cut this 107s -> 22s in the research.
+  * compile+profile+capture is 51% of the spin-up and the torch.compile cache
+    MISSED: persist VLLM_CACHE_ROOT on reused storage (disk/volume/bucket) —
+    NOTE: the cache key includes the --model path string, so warm it with the
+    exact --model value the replay uses. Measured effect: compile 49->7s,
+    warm-up+capture 192->20s, profiling 107->22s.
+
+ WARNINGS
+  ! 106 of 1259 log lines had no timestamp prefix and were skipped

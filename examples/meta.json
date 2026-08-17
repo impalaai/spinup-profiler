@@ -1,0 +1,12 @@
+{
+ "name": "base-hf",
+ "run": 2,
+ "image": "vllm/vllm-openai:v0.20.2",
+ "t_launch": 1786983364.3982363,
+ "t_container_start": 1786983364.704368,
+ "t_ready": 1786983834.7617006,
+ "total_launch_to_ready": 470.36346435546875,
+ "total_start_to_ready": 470.05733251571655,
+ "port": 8200,
+ "vllm_args": "--port 8200 --model Qwen/Qwen3.5-27B-FP8 --served-model-name Qwen/Qwen3.5-27B-FP8 --max-model-len 262144 --reasoning-parser qwen3 --max-num-seqs 256"
+}
