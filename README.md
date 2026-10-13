@@ -3,7 +3,7 @@
 Stage-level profiler for **vLLM cold spin-up**. It runs one instrumented spin-up on a GPU box,
 decomposes it into the stages that actually cost time (image pull, imports, engine spawn, weight
 load, torch.compile, kernel warm-up, cudagraph capture, API startup), and tells you which one is
-the bottleneck — plus the lever that shortened it in the IMP-2773 research.
+the bottleneck — plus the lever that shortened it in the Impala spin-up research.
 
 * **Stdlib only.** Python 3.10+, no pip install, nothing to vendor: target boxes have a bare
   `python3`. `urllib` + `argparse` + `json` + `re` + `subprocess`, that's it.
@@ -545,4 +545,4 @@ tests/test_probe.py     probe sections + prefetch + ceiling verdicts (no GPU, no
   read the per-device breakdown in `system.jsonl` before trusting the attribution.
 
 Research background: "Minimizing vLLM Spin-Up Time" (July 2026) and the cross-cloud spin-up
-benchmark (August 2026). Ticket: **IMP-2773**.
+benchmark (August 2026). 

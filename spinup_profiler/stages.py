@@ -116,11 +116,11 @@ def derive_graphs_start(cudagraph_marks, marks):
 
 # --- bottleneck hints: keyed by leaf span name -----------------------------------
 # Every line is a lever measured in the "Minimizing vLLM Spin-Up Time" research
-# (July 2026) and the cross-cloud benchmark (Aug 2026), IMP-2773.
+# (July 2026) and the cross-cloud benchmark (Aug 2026).
 HINTS = {
     "provision_to_ssh":
         "provisioning dominates: keep a warm/dark pool (stopped baked VM -> start reaches SSH in 30-95s) "
-        "instead of creating a fresh instance; see IMP-2773 research.",
+        "instead of creating a fresh instance; see the Impala spin-up research.",
     "host_gpu_ready":
         "driver init is slow on this image: use a provider image with the driver preinstalled, "
         "or persist nvidia module load across boots (nvidia-persistenced).",
@@ -146,7 +146,7 @@ HINTS = {
         "(HF_HUB_OFFLINE=1 with a warm cache) so nothing hits the network.",
     "weight_load":
         "weight transport dominates: try runai_streamer from same-region object storage (~1.4 GB/s measured) "
-        "or local NVMe; HF hub cold-CDN is the slow path; see IMP-2773 research.",
+        "or local NVMe; HF hub cold-CDN is the slow path; see the Impala spin-up research.",
     "compile":
         "torch.compile dominates: persist VLLM_CACHE_ROOT on reused storage — NOTE: the cache key includes the "
         "--model path string, so warm the cache with the exact --model value the replay will use.",

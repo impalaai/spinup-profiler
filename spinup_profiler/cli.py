@@ -33,7 +33,7 @@ EPILOG = """examples:
 def build_parser():
     p = argparse.ArgumentParser(
         prog="spinup-profile",
-        description="Stage-level vLLM spin-up profiler — find the cold-start bottleneck (IMP-2773).",
+        description="Stage-level vLLM spin-up profiler — find the cold-start bottleneck.",
         epilog=EPILOG,
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )

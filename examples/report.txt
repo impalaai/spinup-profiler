@@ -41,7 +41,7 @@
  HINTS
   * weight_load (125.8s, 27%): weight transport dominates: try runai_streamer
     from same-region object storage (~1.4 GB/s measured) or local NVMe; HF hub
-    cold-CDN is the slow path; see IMP-2773 research.
+    cold-CDN is the slow path; see the Impala spin-up research.
   * warmup_kernels (114.9s, 24%): post-KV warm-up dominates: this is mostly
     (cacheable) kernel autotune/compile, not graph capture — persist
     VLLM_CACHE_ROOT; --enforce-eager will NOT remove it.
